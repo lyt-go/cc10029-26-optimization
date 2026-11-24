@@ -108,3 +108,41 @@ class ResumePointService(BaseModuleService):
     def get_pending_resume_points(self) -> list[dict[str, Any]]:
         """获取所有待续传的断点记录列表。"""
         return [r for r in store.rows(self.MODULE) if r.get("status") == "待续传"]
+
+    def create_dispatch_resume(
+        self,
+        batch_code: str,
+        chunk_index: int,
+        completed_chunks: int,
+        pending_chunks: int,
+        point_type: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """为暂停或超时的分片登记续传断点，恢复位置精确到分片序号，保留继续发送的位置。"""
+        resume_code = f"RESU-{batch_code}-C{chunk_index}-{int(time.time())}"
+        values = {
+            "断点编号": resume_code,
+            "批次编号": batch_code,
+            "已完成分片": str(completed_chunks),
+            "未完成分片": str(pending_chunks),
+            "恢复位置": str(chunk_index),
+            "重试次数": "0",
+            "断点类型": point_type,
+            "续传水位": str(completed_chunks),
+        }
+        entry, missing = self.create_entry(values)
+        if entry is None:
+            raise ValueError(f"创建分片续传断点失败: {missing}")
+        entry["分片序号"] = str(chunk_index)
+        entry["中断原因"] = reason
+        self._write_jsonl(
+            self._data_dir("events") / "resume_point_log.jsonl",
+            [{"action": "create_dispatch_resume", "resume_code": resume_code,
+              "batch_code": batch_code, "chunk_index": chunk_index,
+              "point_type": point_type, "reason": reason,
+              "completed_chunks": completed_chunks, "pending_chunks": pending_chunks,
+              "at": time.time()}]
+        )
+        return {"resume_code": resume_code, "resume_id": entry["id"],
+                "batch_code": batch_code, "chunk_index": chunk_index,
+                "point_type": point_type, "resume_position": chunk_index}

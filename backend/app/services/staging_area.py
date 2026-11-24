@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import itertools
+import json
 import time
 from typing import Any
 
@@ -13,6 +15,9 @@ from app.store import store
 
 
 class StagingAreaService(BaseModuleService):
+    # 同一秒内可能多次落地，时间戳不足以区分先后，用进程级序号保证暂存编号严格递增
+    _land_seq = itertools.count(1)
+
     MODULE = "staging_area"
     ENTITY = "暂存分区"
     OPERATION_TERM = "水位"
@@ -118,3 +123,69 @@ class StagingAreaService(BaseModuleService):
             [{"action": "clear", "staging_code": staging_code, "cleared_at": time.time()}]
         )
         return {"staging_code": staging_code, "status": "已清空"}
+
+    def land_delivered_chunks(self, batch_code: str) -> dict[str, Any]:
+        """暂存侧只确认真正交付的分片：读取批次交付产物（仅含已发送的片）落地。
+
+        与全量落地不同，本方法不读取批次全量源文件，只读取
+        dispatches/<批次>_delivered.jsonl，未发送、暂停、超时的片不会进入暂存范围，
+        同时登记已交付片覆盖的行范围与各自规则版本，供后续范围与版本核对。
+        """
+        dispatch_dir = self._data_dir("dispatches")
+        delivered_file = dispatch_dir / f"{batch_code}_delivered.jsonl"
+        records = self._read_jsonl(delivered_file)
+
+        # 汇总交付范围（按分片行号区间）与规则版本集合
+        plan_file = dispatch_dir / f"{batch_code}_plan.json"
+        ranges: list[str] = []
+        rule_versions: list[str] = []
+        delivered_chunks: list[int] = []
+        if plan_file.exists():
+            plan = json.loads(plan_file.read_text(encoding="utf-8"))
+            for chunk in plan["chunks"]:
+                if chunk.get("delivered"):
+                    ranges.append(f"{chunk['line_start']}-{chunk['line_end']}")
+                    delivered_chunks.append(chunk["chunk_index"])
+                    version = chunk.get("rule_version")
+                    if version and version not in rule_versions:
+                        rule_versions.append(version)
+
+        staging_code = f"STAG-{batch_code}-DELIV-{int(time.time())}-{next(self._land_seq):04d}"
+        values = {
+            "暂存编号": staging_code,
+            "批次编号": batch_code,
+            "落地路径": f"/staging/{batch_code}/delivered/",
+            "文件数量": "1",
+            "记录条数": str(len(records)),
+            "占用字节": str(sum(len(str(r).encode("utf-8")) for r in records)),
+            "驻留时限": "86400",
+            "落地水位": str(len(records)),
+        }
+        entry, missing = self.create_entry(values)
+        if entry is None:
+            raise ValueError(f"创建交付暂存分区失败: {missing}")
+        entry["暂存范围"] = ",".join(ranges)
+        entry["规则版本"] = ",".join(rule_versions)
+        entry["交付分片"] = ",".join(str(i) for i in delivered_chunks)
+        self.run_action(entry["id"], "确认落地")
+
+        output_file = self._data_dir("staging") / f"{staging_code}.jsonl"
+        self._write_jsonl(output_file, records)
+        self._write_checkpoint(f"staging_{staging_code}", {
+            "staging_code": staging_code,
+            "batch_code": batch_code,
+            "records_landed": len(records),
+            "line_ranges": ranges,
+            "rule_versions": rule_versions,
+            "delivered_chunks": delivered_chunks,
+            "landed_at": time.time(),
+        })
+        return {
+            "staging_code": staging_code,
+            "batch_code": batch_code,
+            "records_landed": len(records),
+            "line_ranges": ranges,
+            "rule_versions": rule_versions,
+            "delivered_chunks": delivered_chunks,
+            "artifact_path": str(output_file),
+        }

@@ -98,3 +98,44 @@ class ChannelConfigService(BaseModuleService):
     def get_active_channels(self) -> list[dict[str, Any]]:
         """获取所有已生效的传输通道配置列表。"""
         return [r for r in store.rows(self.MODULE) if r.get("status") == "已生效"]
+
+    def update_timeout(self, channel_id: int, timeout_seconds: int) -> dict[str, Any]:
+        """变更通道时限并推进配置版本，供下一张判定单按新实际时限出具。
+
+        已出具的历史判定单不受影响（不可变），变更后新发送的分片重新判定时会读到
+        新时限与新版本，从而在判定单上留下规则版本轨迹。
+        """
+        channel = self.get_entry(channel_id)
+        if channel is None:
+            return {"error": f"传输通道 {channel_id} 不存在"}
+        if timeout_seconds <= 0:
+            return {"error": f"通道时限必须为正整数秒，收到 {timeout_seconds}"}
+
+        old_timeout = channel.get("超时秒数")
+        old_version = str(channel.get("配置版本", "v1.0"))
+        try:
+            major = int(old_version.lstrip("vV").split(".")[0])
+        except ValueError:
+            major = 1
+        new_version = f"v{major + 1}.0"
+        channel["超时秒数"] = str(timeout_seconds)
+        channel["配置版本"] = new_version
+
+        record = {
+            "action": "update_timeout",
+            "channel_code": channel["通道编号"],
+            "old_timeout": old_timeout,
+            "new_timeout": timeout_seconds,
+            "old_version": old_version,
+            "new_version": new_version,
+            "at": time.time(),
+        }
+        self._write_jsonl(
+            self._data_dir("channels") / f"{channel['通道编号']}_config.jsonl", [record]
+        )
+        return {
+            "channel_code": channel["通道编号"],
+            "old_timeout": old_timeout,
+            "timeout_seconds": timeout_seconds,
+            "rule_version": new_version,
+        }
